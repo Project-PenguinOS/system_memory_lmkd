@@ -275,8 +275,32 @@ static Reaper reaper;
 static int reaper_comm_fd[2];
 static int32_t MGLRU_status = 0;
 
+static bool force_consider_cache = false;
+
+// When true, the current kill pass must not kill foreground (top-critical) processes
+// even in the final PROTECT_NONE fallback. Set per-event based on kill_reason: PSI-driven
+// reasons (throttle / compaction / critical pressure) protect the foreground, while real
+// watermark breaches and the not-responding last resort are still allowed to kill it.
+// Reset at the start of every __mp_event_psi via PerEventKillStateGuard.
+static bool protect_foreground_this_kill = false;
+// Master switch for the "protect foreground until watermark" behavior above.
+static bool protect_fg_until_wmark = true;
+
+// RAII guard that clears the per-event kill state flags on both entry and exit of
+// __mp_event_psi, so a flag set during one pressure event never leaks into the next
+// regardless of which return path the function takes.
+struct PerEventKillStateGuard {
+    PerEventKillStateGuard() {
+        force_consider_cache = false;
+        protect_foreground_this_kill = false;
+    }
+    ~PerEventKillStateGuard() {
+        force_consider_cache = false;
+        protect_foreground_this_kill = false;
+    }
+};
+
 static bool lazy_kill_weight_proc_enabled = false;
-static bool lazy_kill_visible_proc_enabled = true;
 static bool use_harden_limit = false;
 static int total_available_threshold_kb = 800 * 1024;
 
@@ -622,6 +646,7 @@ struct proc {
     CgroupFD cgroupfd;
     uid_t uid;
     int oomadj;
+    enum proc_type ptype;
     pid_t reg_pid; /* PID of the process that registered this record */
     bool valid;
     int weight;
@@ -1597,6 +1622,7 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         procp->oomadj = oom_adj_score;
         procp->valid = true;
         procp->weight = proc.weight;
+        procp->ptype = proc.ptype;
         proc_insert(procp);
     } else {
         if (!claim_record(procp, cred->pid)) {
@@ -1610,6 +1636,7 @@ static void register_oom_adj_proc(const struct lmk_procprio& proc, struct ucred*
         proc_unslot(procp);
         procp->oomadj = oom_adj_score;
         procp->weight = proc.weight;
+        procp->ptype = proc.ptype;
         proc_slot(procp);
     }
 }
@@ -1619,6 +1646,7 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
     char val[20];
     int64_t tgid;
     char buf[BUF_MAX];
+    struct lmk_procprio sanitized_params = params;
 
     if (params.oomadj < OOM_SCORE_ADJ_MIN || params.oomadj > OOM_SCORE_ADJ_MAX) {
         ALOGE("Invalid PROCPRIO oomadj argument %d", params.oomadj);
@@ -1626,8 +1654,12 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
     }
 
     if (params.ptype < PROC_TYPE_FIRST || params.ptype >= PROC_TYPE_COUNT) {
-        ALOGE("Invalid PROCPRIO process type argument %d", params.ptype);
-        return;
+        // Do not drop the whole update (oom_score_adj is set below) just because of an
+        // unrecognized process type, e.g. when framework and lmkd are temporarily out of
+        // sync on the enum. Fall back to PROC_TYPE_APP instead.
+        ALOGE("Invalid PROCPRIO process type argument %d, falling back to PROC_TYPE_APP",
+              params.ptype);
+        sanitized_params.ptype = PROC_TYPE_APP;
     }
 
     /* Check if registered process is a thread group leader */
@@ -1659,7 +1691,7 @@ static void apply_proc_prio(const struct lmk_procprio& params, struct ucred* cre
         }
     }
 
-    register_oom_adj_proc(params, cred);
+    register_oom_adj_proc(sanitized_params, cred);
 }
 
 static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred* cred) {
@@ -2821,9 +2853,75 @@ static struct proc *proc_adj_head(int oomadj) {
     return (struct proc *)&procadjslot_list[ADJTOSLOT(oomadj)];
 }
 
+// Protection level used while selecting a victim so that top-critical and home
+// apps are killed last.
+// PROTECT_HOME_AND_TOP: skip both home and top-critical processes.
+// PROTECT_TOP_ONLY:     allow killing home, still skip top-critical processes.
+// PROTECT_NONE:         no protection, everything is killable (final fallback).
+enum protect_level {
+    PROTECT_HOME_AND_TOP = 0,
+    PROTECT_TOP_ONLY,
+    PROTECT_NONE,
+};
+
+static bool proc_is_top_critical(struct proc *procp) {
+    // Top-critical processes include framework-tagged top/top-bound processes
+    // plus the top-app cpuset fallback for old framework payloads.
+    if (procp->ptype == PROC_TYPE_TOP || procp->ptype == PROC_TYPE_TOP_BOUND) {
+        return true;
+    }
+    // cpuset fallback: protect any process currently in the top-app cpuset,
+    // regardless of oom_score_adj. A foreground app that is still launching
+    // (e.g. stuck on its splash activity) sits at VISIBLE/PERCEPTIBLE adj
+    // (100/200) rather than 0 until its activity is resumed, but it is already
+    // placed in the top-app cpuset. Requiring adj<=0 here left that launch
+    // window unprotected and let such apps be killed as ordinary background
+    // apps in the first pass.
+    return proc_is_top_app(procp->pid);
+}
+
+// Returns true if procp must be skipped (protected) at the given protection level.
+static bool proc_is_protected(struct proc *procp, enum protect_level level) {
+    if (level == PROTECT_NONE) {
+        // Normally the final fallback protects nothing. But when this kill was
+        // triggered by a PSI/pressure signal (not a real watermark breach), keep
+        // foreground (top-critical) processes protected even here: they should
+        // only be sacrificed when memory is genuinely low (watermark) or as the
+        // not-responding last resort.
+        if (protect_fg_until_wmark && protect_foreground_this_kill &&
+                proc_is_top_critical(procp)) {
+            return true;
+        }
+        return false;
+    }
+    if (procp->ptype == PROC_TYPE_HOME && level == PROTECT_HOME_AND_TOP) {
+        return true;
+    }
+    if (proc_is_top_critical(procp)) {
+        return true;
+    }
+    return false;
+}
+
 // When called from a non-main thread, adjslot_list_lock read lock should be taken.
 static struct proc *proc_adj_tail(int oomadj) {
     return (struct proc *)adjslot_tail(&procadjslot_list[ADJTOSLOT(oomadj)]);
+}
+
+// Like proc_adj_tail but skips processes protected at the given level. Walks from the
+// tail towards the head and returns the first non-protected process, or NULL.
+static struct proc *proc_adj_tail_protected(int oomadj, enum protect_level level) {
+    struct adjslot_list *head = &procadjslot_list[ADJTOSLOT(oomadj)];
+    struct adjslot_list *curr = head->prev;
+
+    while (curr != head) {
+        struct proc *procp = (struct proc *)curr;
+        if (!proc_is_protected(procp, level)) {
+            return procp;
+        }
+        curr = curr->prev;
+    }
+    return NULL;
 }
 
 // When called from a non-main thread, adjslot_list_lock read lock should be taken.
@@ -2842,7 +2940,7 @@ static struct proc *proc_adj_prev(int oomadj, int pid) {
 }
 
 // Can be called only from the main thread.
-static struct proc *proc_get_heaviest(int oomadj) {
+static struct proc *proc_get_heaviest(int oomadj, enum protect_level level) {
     struct adjslot_list *head = &procadjslot_list[ADJTOSLOT(oomadj)];
     struct adjslot_list *curr = head->next;
     struct proc *maxprocp = NULL;
@@ -2856,9 +2954,15 @@ static struct proc *proc_get_heaviest(int oomadj) {
 
     if ((curr != head) && (curr->next == head)) {
         // Our list only has one process.  No need to access procfs for its size.
-        return (struct proc *)curr;
+        struct proc *only = (struct proc *)curr;
+        return proc_is_protected(only, level) ? NULL : only;
     }
     while (curr != head) {
+        if (proc_is_protected((struct proc *)curr, level)) {
+            // Protected process: leave it for a later (less protected) pass.
+            curr = curr->next;
+            continue;
+        }
         int pid = ((struct proc *)curr)->pid;
         long tasksize = proc_get_size(pid);
         int64_t dmabuf_pss_bytes;
@@ -2892,6 +2996,39 @@ static struct proc *proc_get_heaviest(int oomadj) {
     } else {
         return maxprocp_pa;
     }
+}
+
+static bool has_kill_candidate(int min_score_adj, enum protect_level level) {
+    for (int i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
+        if (proc_adj_tail_protected(i, level)) {
+            return true;
+        }
+    }
+
+    if (!lazy_kill_weight_proc_enabled) {
+        return false;
+    }
+
+    for (int i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
+        struct weightslot_list *head = &procweightslot_list[i];
+        struct weightslot_list *curr = head->prev;
+
+        while (curr != head) {
+            struct proc *procp = container_of(curr, struct proc, wsl);
+
+            if (procp->oomadj >= min_score_adj && !proc_is_protected(procp, level)) {
+                return true;
+            }
+            curr = curr->prev;
+        }
+    }
+
+    return false;
+}
+
+static bool only_home_or_top_left_to_kill(int min_score_adj) {
+    return !has_kill_candidate(min_score_adj, PROTECT_HOME_AND_TOP) &&
+            has_kill_candidate(min_score_adj, PROTECT_NONE);
 }
 
 /*
@@ -3278,51 +3415,100 @@ out:
  * Find one process to kill at or above the given oom_score_adj level.
  * Returns size of the killed process.
  */
+static int find_and_kill_weight_process(enum protect_level level, int min_score_adj,
+                                        struct kill_info *ki, union meminfo *mi,
+                                        struct wakeup_info *wi, struct timespec *tm,
+                                        struct psi_data *pd) {
+    for (int i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
+        struct weightslot_list *head = &procweightslot_list[i];
+        struct weightslot_list *curr = head->prev;
+        struct proc *procp;
+
+        while (curr != head) {
+            procp = container_of(curr, struct proc, wsl);
+            struct weightslot_list *prev = curr->prev;
+
+            if (proc_is_protected(procp, level)) {
+                curr = prev;
+                continue;
+            }
+
+            int killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
+
+            if (killed_size >= 0) {
+                if (debug_process_killing) {
+                    char buf[BUF_MAX];
+                    const char* proc_name = proc_get_name(procp->pid, buf, sizeof(buf));
+                    ALOGE("Find target kill app from weight list: "
+                        "name %s, weight: %d",
+                        proc_name, procp->weight);
+                }
+                return killed_size;
+            }
+            curr = prev;
+        }
+    }
+
+    return -1;
+}
+
 static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union meminfo *mi,
                                  struct wakeup_info *wi, struct timespec *tm,
                                  struct psi_data *pd) {
     int i;
-    int killed_size = 0;
     bool choose_heaviest_task = kill_heaviest_task;
+    bool weight_list_logged = false;
 
-    if (lazy_kill_weight_proc_enabled && lazy_kill_visible_proc_enabled) {
-        if (min_score_adj <= VISIBLE_APP_ADJ) {
-            min_score_adj = VISIBLE_APP_ADJ + 1;
-        }
-    }
+    /*
+     * Kill in increasing order of protection so that home and top apps are killed last:
+     *   pass 1 (PROTECT_HOME_AND_TOP): only ordinary apps are eligible;
+     *   pass 2 (PROTECT_TOP_ONLY):     home becomes eligible (killed before top);
+     *   pass 3 (PROTECT_NONE):         top becomes eligible (killed last).
+     * find_and_kill_process kills at most one victim per call, so a later pass is only
+     * reached when no less-protected victim exists anywhere in [min_score_adj, MAX].
+     */
+    for (enum protect_level level = PROTECT_HOME_AND_TOP; level <= PROTECT_NONE;
+            level = (enum protect_level)(level + 1)) {
+        choose_heaviest_task = kill_heaviest_task;
+        for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
+            struct proc *procp;
 
-    for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
-        struct proc *procp;
+            if (!choose_heaviest_task && i <= PERCEPTIBLE_APP_ADJ) {
+                /*
+                 * If we have to choose a perceptible process, choose the heaviest one to
+                 * hopefully minimize the number of victims.
+                 */
+                choose_heaviest_task = true;
+            }
 
-        if (!choose_heaviest_task && i <= PERCEPTIBLE_APP_ADJ) {
-            /*
-             * If we have to choose a perceptible process, choose the heaviest one to
-             * hopefully minimize the number of victims.
-             */
-            choose_heaviest_task = true;
-        }
+            while (true) {
+                procp = choose_heaviest_task ?
+                    proc_get_heaviest(i, level) : proc_adj_tail_protected(i, level);
 
-        while (true) {
-            procp = choose_heaviest_task ?
-                proc_get_heaviest(i) : proc_adj_tail(i);
+                if (!procp)
+                    break;
 
-            if (!procp)
-                break;
+                if (debug_process_killing) {
+                    static const char* const protect_level_name[] = {
+                        "HOME_AND_TOP", "TOP_ONLY", "NONE"};
+                    char name_buf[BUF_MAX];
+                    const char* proc_name =
+                            proc_get_name(procp->pid, name_buf, sizeof(name_buf));
+                    ALOGI("Victim selected: pid=%d uid=%d oomadj=%d ptype=%d name=%s "
+                          "(protect_level=%s adj_slot=%d)",
+                          procp->pid, procp->uid, procp->oomadj, procp->ptype,
+                          proc_name ? proc_name : "<unknown>", protect_level_name[level], i);
+                }
 
-            killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
-            if (killed_size >= 0) {
-                return killed_size;
+                int result = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
+                if (result >= 0) {
+                    return result;
+                }
             }
         }
-    }
 
-    if (lazy_kill_weight_proc_enabled) {
-        if (killed_size) {
-            if (debug_process_killing) {
-                ALOGE("Find target kill app from default list: size=%zu", killed_size);
-            }
-        } else {
-            if (debug_process_killing) {
+        if (lazy_kill_weight_proc_enabled) {
+            if (debug_process_killing && !weight_list_logged) {
                 // Log all processes in weight lists before attempting any kills
                 for (int i = 0; i < WEIGHT_TO_SLOT_COUNT; i++) {
                     struct weightslot_list *head = &procweightslot_list[i];
@@ -3343,52 +3529,26 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
                         curr = curr->prev;
                     }
                 }
+                weight_list_logged = true;
             }
 
-            bool process_killed = false;
-
-            for (int i = 0; i < WEIGHT_TO_SLOT_COUNT && !process_killed; i++) {
-                struct weightslot_list *head = &procweightslot_list[i];
-                struct weightslot_list *curr = head->prev;
-                struct proc *procp;
-
-                while (curr != head) {
-                    procp = container_of(curr, struct proc, wsl);
-                    struct weightslot_list *prev = curr->prev;
-
-                    // Kill weight processes (Weight 0->3), but SKIP foreground (top-app cpuset).
-                    // Skipped processes will be handled in last tier (Retry pass)
-                    if (lazy_kill_visible_proc_enabled && procp->oomadj == 0 &&
-                                proc_is_top_app(procp->pid)) {
-                        curr = prev;
-                        continue;
-                    }
-
-                    killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
-
-                    if (killed_size >= 0) {
-                        process_killed = true;
-
-                        if (debug_process_killing) {
-                            char buf[BUF_MAX];
-                            const char* proc_name = proc_get_name(procp->pid, buf, sizeof(buf));
-                            ALOGE("Find target kill app from weight list: "
-                                "name %s, weight: %d",
-                                proc_name, procp->weight);
-                        }
-                        break; // Exit inner while loop
-                    }
-                    curr = prev;
-                }
+            int weight_killed_size =
+                    find_and_kill_weight_process(level, min_score_adj, ki, mi, wi, tm, pd);
+            if (weight_killed_size >= 0) {
+                return weight_killed_size;
             }
         }
     }
 
-    if (!killed_size && !min_score_adj && is_userdebug_or_eng_build) {
-        killed_size = proc_get_script();
+    if (!min_score_adj && is_userdebug_or_eng_build) {
+        if (protect_fg_until_wmark && protect_foreground_this_kill) {
+            ULMK_LOG(D, "Skip /proc fallback while foreground protection is active");
+        } else {
+            return proc_get_script();
+        }
     }
 
-    return killed_size;
+    return 0;
 }
 
 static int64_t get_memory_usage(struct reread_data *file_data) {
@@ -3506,7 +3666,7 @@ static enum zone_watermark get_lowest_watermark(union meminfo *mi,
     int64_t nr_swapcached = mi->field.swap_cached / page_k;
     nr_free_pages += nr_swapcached;
 
-    if (should_consider_cache_free(events, level, in_compaction)) {
+    if (should_consider_cache_free(events, level, in_compaction) || force_consider_cache) {
         file_cache = zmi->nr_zone_inactive_file + zmi->nr_zone_active_file;
         nr_cached_pages = file_cache > 0 ? (int64_t)(cache_percent * file_cache) : 0;
     }
@@ -3628,7 +3788,9 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_meminfo *zmi, int64_t
                  * So, consider the file caches only from the zones with
                  * watermark breached.
                  */
-                if (MGLRU_status == 0 || zone->fields.field.nr_free_pages <= zone->fields.field.high * wbf_effective){
+                bool consider_this_zone = force_consider_cache || MGLRU_status == 0 ||
+                        (zone->fields.field.nr_free_pages - zone->fields.field.nr_free_cma) <= zone->fields.field.high * wbf_effective;
+                if (consider_this_zone) {
                     zmi->nr_zone_inactive_file += zone->fields.field.nr_zone_inactive_file;
                     zmi->nr_zone_active_file += zone->fields.field.nr_zone_active_file;
                 }
@@ -3796,6 +3958,8 @@ static void __mp_event_psi(enum event_source source, union psi_event_data data,
     bool critical_stall = false;
     int64_t pgskip_deltas[VS_PGSKIP_LAST_ZONE - VS_PGSKIP_FIRST_ZONE + 1] = {0};
     struct zoneinfo zi;
+    PerEventKillStateGuard per_event_kill_state_guard;
+    bool retried_with_force_consider_cache = false;
 
     if (events &&
        (!poll_params->poll_handler || data.level >= poll_params->poll_handler->data)) {
@@ -4068,6 +4232,11 @@ static void __mp_event_psi(enum event_source source, union psi_event_data data,
     }
 
 update_watermarks:
+    kill_reason = NONE;
+    min_score_adj = 0;
+    cut_thrashing_limit = false;
+    kill_desc[0] = '\0';
+
     if (zoneinfo_parse(&zi) < 0) {
         ALOGE("Failed to parse zoneinfo!");
         return;
@@ -4123,6 +4292,8 @@ update_watermarks:
         kill_reason = DIRECT_RECL_AND_THROT;
         strlcpy(kill_desc, "system processes are being throttled", sizeof(kill_desc));
         kill_desc[sizeof(kill_desc) - 1] = '\0';
+        /* PSI-driven pressure, not a real watermark breach: protect foreground. */
+        protect_foreground_this_kill = true;
     } else if (level == VMPRESS_LEVEL_CRITICAL && (events != 0 && wmark <= WMARK_HIGH)) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
@@ -4132,6 +4303,8 @@ update_watermarks:
         kill_reason = CRITICAL_KILL;
         strlcpy(kill_desc, "critical pressure and device is low on memory", sizeof(kill_desc));
         min_score_adj = PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ;
+        /* PSI-driven pressure, not a real watermark breach: protect foreground. */
+        protect_foreground_this_kill = true;
     } else if (level == VMPRESS_LEVEL_SUPER_CRITICAL && (events != 0 && wmark <= WMARK_HIGH)) {
         /*
          * Device is too busy reclaiming memory which might lead to ANR.
@@ -4221,6 +4394,8 @@ update_watermarks:
         kill_reason = COMPACTION;
         strlcpy(kill_desc, "device is in compaction and low on memory", sizeof(kill_desc));
         min_score_adj = VISIBLE_APP_ADJ;
+        /* PSI-driven pressure, not a real watermark breach: protect foreground. */
+        protect_foreground_this_kill = true;
     }
 
     /* Check if a cached app should be killed */
@@ -4266,24 +4441,23 @@ update_watermarks:
         if (critical_stall) {
             min_score_adj = 0;
         }
+
+        if (!force_consider_cache && !retried_with_force_consider_cache &&
+                only_home_or_top_left_to_kill(min_score_adj)) {
+            force_consider_cache = true;
+            retried_with_force_consider_cache = true;
+            ULMK_LOG(D, "Only home/top kill candidates remain; recomputing watermarks with cache");
+            goto update_watermarks;
+        }
+
         psi_parse_io(&psi_data);
         psi_parse_cpu(&psi_data);
         int pages_freed = 0;
         // Kill Tier:
-        // 1. Tier 4 (First): Ordinary Background Apps (Adj > 100)
-        //    - Handled by standard list in Pass 1.
-        // 2. Tier 3: Weighted Background Apps (Weight 0-3, Non top-app)
-        //    - Handled by weight list in Pass 1.
-        // 3. Tier 2: Ordinary Visible Apps (Adj <= 100)
-        //    - Handled by standard list in Pass 2 (Retry).
-        // 4. Tier 1 (Last): Weighted Foreground Apps (Weight 0-3, top-app)
-        //    - Handled by weight list in Pass 2 (Retry).
+        // 1. Ordinary apps from the adj and weight lists.
+        // 2. Home, if no ordinary candidates remain.
+        // 3. Top/top-bound, only as the final fallback.
         pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
-        if (pages_freed <= 0 && lazy_kill_weight_proc_enabled) {
-            lazy_kill_visible_proc_enabled = false;
-            pages_freed = find_and_kill_process(min_score_adj, &ki, &mi, &wi, &curr_tm, &psi_data);
-            lazy_kill_visible_proc_enabled = true;
-        }
         if (pages_freed > 0) {
             killing = true;
             max_thrashing = 0;
@@ -5156,6 +5330,11 @@ static void update_perf_props() {
         strlcpy(property, perf_get_prop("ro.lmk.kill_heaviest_task_dup", default_value).value,
             PROPERTY_VALUE_MAX);
         kill_heaviest_task = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
+
+        strlcpy(default_value, (protect_fg_until_wmark)? "true" : "false", PROPERTY_VALUE_MAX);
+        strlcpy(property, perf_get_prop("ro.lmk.protect_fg_until_wmark", default_value).value,
+            PROPERTY_VALUE_MAX);
+        protect_fg_until_wmark = (!strncmp(property,"false",PROPERTY_VALUE_MAX))? false : true;
 
         snprintf(default_value, PROPERTY_VALUE_MAX, "%lu", (kill_timeout_ms));
         strlcpy(property, perf_get_prop("ro.lmk.kill_timeout_ms_dup", default_value).value,
